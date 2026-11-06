@@ -1,0 +1,6 @@
+telethon
+aiohttp
+python-dotenv
+cryptg
+motor
+dnspython

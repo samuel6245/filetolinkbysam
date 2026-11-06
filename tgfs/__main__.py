@@ -1,0 +1,144 @@
+# tgfilestream
+# Copyright (C) 2025-2026 Deekshith SH
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import asyncio
+import traceback
+from aiohttp import web
+from telethon import functions
+from telethon.tl.types import User
+
+from tgfs.app import init_app
+from tgfs.info import __version__
+from tgfs.log import log
+from tgfs.config import Config
+from tgfs.paralleltransfer import ParallelTransferrer
+from tgfs.telegram import client, load_plugins, multi_clients, start_clients
+from tgfs.database import DB
+from tgfs.utils.utils import load_configs, load_patches, parse_version
+
+load_patches(Config.PATCH_PATH)
+
+app = init_app()
+runner = web.AppRunner(app, handler_cancellation=True)
+
+async def additional_check():
+    version = await DB.db.get_config_value("VERSION")
+    if not version:
+        await DB.db.set_config_value("VERSION", __version__)
+        return
+
+    version_v = parse_version(version)
+    # target_v = parse_version(__version__)
+    min_target = parse_version(DB.MIN_VERSION)
+
+    if version_v < min_target:
+        log.error("Version mismatch, update database structure to match new version" \
+        "check README.md for more information")
+        raise RuntimeError(f"Version mismatch detected. Old: {version} → New: {__version__}")
+
+async def start() -> None:
+    log.info("Initializing Database")
+    DB.load_config()
+    await DB.init()
+    await load_configs()
+    log.info("Running Checks")
+    await additional_check()
+    log.info("Starting Telegram Client")
+    await client.start(bot_token=Config.BOT_TOKEN)
+    if not Config.NO_UPDATE:
+        load_plugins("tgfs/plugins")
+
+    # https://github.com/LonamiWebs/Telethon/blob/59da66e105ba29eee7760538409181859c7d310d/telethon/client/downloads.py#L62
+    config = await client(functions.help.GetConfigRequest())
+    for option in config.dc_options:
+        if option.ip_address == client.session.server_address:
+            client.session.set_dc(
+                option.id, option.ip_address, option.port)
+            client.session.save()
+            break
+    me: User = await client.get_me()
+    Config.BOT_ID = me.id
+    log.info("Starting Additional Clients")
+    await start_clients()
+    if not (Config.NO_MAIN or multi_clients):
+        transfer = ParallelTransferrer(client, me.id)
+        transfer.post_init()
+        multi_clients.append(transfer)
+    log.info("Starting HTTP Server")
+    await runner.setup()
+    await web.TCPSite(runner, Config.HOST, Config.PORT).start()
+    log.info("Version: %s", __version__)
+    log.info("Username: %s", me.username)
+    log.info("DC ID: %d", getattr(client.session, "dc_id", None))
+    log.info("URL: %s", Config.PUBLIC_URL)
+
+
+async def stop() -> None:
+    log.debug("Stopping HTTP Server")
+    await runner.cleanup()
+    log.debug("Closing Telegram Client and Connections")
+    await client.disconnect()
+    log.debug("Closing Database Connection")
+    await DB.close()
+    log.info("Stopped Bot and Server")
+
+def log_pending_tasks(include_stack: bool = False):
+    log_child = log.getChild("tasks")
+    current = asyncio.current_task()
+    tasks = asyncio.all_tasks()
+
+    log_child.debug("Pending asyncio tasks")
+
+    for task in tasks:
+        if task is current:
+            continue
+
+        if task.done():
+            continue
+
+        log_child.debug(
+            "Task name=%s cancelled=%s coro=%s",
+            task.get_name(),
+            task.cancelled(),
+            task.get_coro(),
+        )
+
+        if include_stack:
+            stack = task.get_stack()
+            if stack:
+                log_child.debug("Stack for task %s:", task.get_name())
+                for frame in stack:
+                    formatted = "".join(traceback.format_stack(frame))
+                    log_child.debug("%s", formatted)
+            else:
+                log_child.debug("No stack available for %s", task.get_name())
+
+async def main() -> None:
+    try:
+        await start()
+        await client.run_until_disconnected()
+    finally:
+        log_pending_tasks(True)
+        await stop()
+        log.info("Stopped Services")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception: # pylint: disable=W0718
+        log.error(traceback.format_exc())
